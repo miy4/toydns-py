@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 import random
+import socket
 import struct
 from dataclasses import astuple, dataclass
+from io import BytesIO
 
 TYPE_A = 1
 CLASS_IN = 1
@@ -44,6 +48,27 @@ class DNSQuestion:
     name: bytes
     type_: int
     class_: int
+
+
+@dataclass
+class DNSRecord:
+    """
+    Represents a DNS record.
+
+    Attributes
+    ----------
+    name (bytes): The domain name associated with the record.
+    type_ (int): The type of the DNS record (e.g., A, NS, CNAME).
+    class_ (int): The class of the DNS record (usually IN for internet).
+    ttl (int): Time to live - the time period that the record may be cached.
+    data (bytes): The data of the DNS record (e.g., IP address, another domain name).
+    """
+
+    name: bytes
+    type_: int
+    class_: int
+    ttl: int
+    data: bytes
 
 
 def header_to_bytes(header: DNSHeader) -> bytes:
@@ -116,3 +141,180 @@ def build_query(domain_name: str, record_type: int) -> bytes:
     question = DNSQuestion(name=name, type_=record_type, class_=CLASS_IN)
 
     return header_to_bytes(header) + question_to_bytes(question)
+
+
+def parse_header(reader: BytesIO) -> DNSHeader:
+    """
+    Parse the header of a DNS packet.
+
+    Args:
+    ----
+    reader (BytesIO): A BytesIO stream containing the DNS packet.
+
+    Returns:
+    -------
+    DNSHeader: The parsed DNS header.
+    """
+    items = struct.unpack("!HHHHHH", reader.read(12))
+    return DNSHeader(*items)
+
+
+def parse_question(reader: BytesIO) -> DNSQuestion:
+    """
+    Parse a DNS question section from a DNS packet.
+
+    Args:
+    ----
+    reader (BytesIO): A BytesIO stream containing the DNS packet.
+
+    Returns:
+    -------
+    DNSQuestion: The parsed DNS question.
+    """
+    name = decode_name(reader)
+    data = reader.read(4)
+    type_, class_ = struct.unpack("!HH", data)
+    return DNSQuestion(name, type_, class_)
+
+
+def parse_record(reader: BytesIO) -> DNSRecord:
+    """
+    Parse a DNS record from a DNS packet.
+
+    Args:
+    ----
+    reader (BytesIO): A BytesIO stream containing the DNS packet.
+
+    Returns:
+    -------
+    DNSRecord: The parsed DNS record.
+    """
+    name = decode_name(reader)
+    data = reader.read(10)
+    type_, class_, ttl, data_len = struct.unpack("!HHIH", data)
+    data = reader.read(data_len)
+    return DNSRecord(name, type_, class_, ttl, data)
+
+
+def decode_name(reader: BytesIO) -> bytes:
+    """
+    Decode a domain name from a DNS packet.
+
+    Args:
+    ----
+    reader (BytesIO): A BytesIO stream containing the DNS packet.
+
+    Returns:
+    -------
+    bytes: The decoded domain name.
+    """
+    parts = []
+    while (length := reader.read(1)[0]) != 0:
+        if length & 0b1100_0000:
+            parts.append(decode_compressed_name(length, reader))
+            break
+
+        parts.append(reader.read(length))
+
+    return b".".join(parts)
+
+
+def decode_compressed_name(length: int, reader: BytesIO) -> bytes:
+    """
+    Decode a compressed domain name from a DNS packet.
+
+    Args:
+    ----
+    length (int): The length of the compressed name.
+    reader (BytesIO): A BytesIO stream containing the DNS packet.
+
+    Returns:
+    -------
+    bytes: The decoded domain name.
+    """
+    pointer_bytes = bytes([length & 0b0011_1111]) + reader.read(1)
+    pointer = struct.unpack("!H", pointer_bytes)[0]
+    current_pos = reader.tell()
+    reader.seek(pointer)
+    result = decode_name(reader)
+    reader.seek(current_pos)
+    return result
+
+
+@dataclass
+class DNSPacket:
+    """
+    Represents a full DNS packet.
+
+    Attributes
+    ----------
+    header (DNSHeader): The header section of the DNS packet.
+    questions (list[DNSQuestion]): A list of questions in the DNS packet.
+    answers (list[DNSRecord]): A list of answer records in the DNS packet.
+    authorities (list[DNSRecord]): A list of authority records in the DNS packet.
+    additionals (list[DNSRecord]): A list of additional records in the DNS packet.
+    """
+
+    header: DNSHeader
+    questions: list[DNSQuestion]
+    answers: list[DNSRecord]
+    authorities: list[DNSRecord]
+    additionals: list[DNSRecord]
+
+
+def parse_dns_packet(data: bytes) -> DNSPacket:
+    """
+    Parse a complete DNS packet.
+
+    Args:
+    ----
+    data (bytes): The DNS packet in byte format.
+
+    Returns:
+    -------
+    DNSPacket: The parsed DNS packet.
+    """
+    reader = BytesIO(data)
+    header = parse_header(reader)
+    questions = [parse_question(reader) for _ in range(header.num_questions)]
+    answers = [parse_record(reader) for _ in range(header.num_answers)]
+    authorities = [parse_record(reader) for _ in range(header.num_authorities)]
+    additionals = [parse_record(reader) for _ in range(header.num_additionals)]
+
+    return DNSPacket(header, questions, answers, authorities, additionals)
+
+
+def ip_to_string(ip: bytes) -> str:
+    """
+    Convert an IP address in bytes to a string format.
+
+    Args:
+    ----
+    ip (bytes): The IP address in byte format.
+
+    Returns:
+    -------
+    str: The IP address in string format.
+    """
+    return ".".join([str(x) for x in ip])
+
+
+def lookup_domain(domain_name: str) -> str:
+    """
+    Look up the IP address for a given domain name using a DNS query.
+
+    Args:
+    ----
+    domain_name (str): The domain name to look up.
+
+    Returns:
+    -------
+    str: The IP address of the domain.
+    """
+    query = build_query(domain_name, TYPE_A)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(query, ("8.8.8.8", 53))
+
+    data, _ = sock.recvfrom(1024)
+    response = parse_dns_packet(data)
+    return ip_to_string(response.answers[0].data)
