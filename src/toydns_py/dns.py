@@ -1,3 +1,5 @@
+"""A simple DNS resolver inspired by "Implement DNS in a weekend" by Julia Evans."""
+
 from __future__ import annotations
 
 import random
@@ -7,6 +9,8 @@ from dataclasses import astuple, dataclass
 from io import BytesIO
 
 TYPE_A = 1
+TYPE_NS = 2
+TYPE_TXT = 16
 CLASS_IN = 1
 
 
@@ -134,8 +138,7 @@ def build_query(domain_name: str, record_type: int) -> bytes:
     bytes: The complete DNS query packet in byte format.
     """
     id_ = random.randint(0, 65535)
-    recursion_desired = 0b100000000
-    header = DNSHeader(id=id_, num_questions=1, flags=recursion_desired)
+    header = DNSHeader(id=id_, num_questions=1, flags=0)
 
     name = encode_dns_name(domain_name)
     question = DNSQuestion(name=name, type_=record_type, class_=CLASS_IN)
@@ -155,6 +158,8 @@ def parse_header(reader: BytesIO) -> DNSHeader:
     -------
     DNSHeader: The parsed DNS header.
     """
+    # 4.1.1. Header section format
+    # https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1
     items = struct.unpack("!HHHHHH", reader.read(12))
     return DNSHeader(*items)
 
@@ -171,6 +176,8 @@ def parse_question(reader: BytesIO) -> DNSQuestion:
     -------
     DNSQuestion: The parsed DNS question.
     """
+    # 4.1.2. Question section format
+    # https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.2
     name = decode_name(reader)
     data = reader.read(4)
     type_, class_ = struct.unpack("!HH", data)
@@ -189,10 +196,19 @@ def parse_record(reader: BytesIO) -> DNSRecord:
     -------
     DNSRecord: The parsed DNS record.
     """
+    # 4.1.3. Resource record format
+    # https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.3
+
     name = decode_name(reader)
     data = reader.read(10)
     type_, class_, ttl, data_len = struct.unpack("!HHIH", data)
-    data = reader.read(data_len)
+    if type_ == TYPE_NS:
+        data = decode_name(reader)
+    elif type_ == TYPE_A:
+        data = ip_to_string(reader.read(data_len))
+    else:
+        data = reader.read(data_len)
+
     return DNSRecord(name, type_, class_, ttl, data)
 
 
@@ -318,3 +334,113 @@ def lookup_domain(domain_name: str) -> str:
     data, _ = sock.recvfrom(1024)
     response = parse_dns_packet(data)
     return ip_to_string(response.answers[0].data)
+
+
+def send_query(ip_address: str, domain_name: str, record_type: int) -> DNSPacket:
+    """
+    Send a DNS query to the specified DNS server and return the response.
+
+    Args:
+    ----
+    ip_address (str): The IP address of the DNS server to which the query is sent.
+    domain_name (str): The domain name for which the DNS query is being made.
+    record_type (int): The type of DNS record being queried (e.g., TYPE_A, TYPE_NS).
+
+    Returns:
+    -------
+    DNSPacket: The DNS packet received in response to the query.
+    """
+    query = build_query(domain_name, record_type)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(query, (ip_address, 53))
+
+    data, _ = sock.recvfrom(1024)
+    return parse_dns_packet(data)
+
+
+def get_answer(packet: DNSPacket) -> bytes | None:
+    """
+    Extract the answer from a DNS response packet.
+
+    Args:
+    ----
+    packet (DNSPacket): The DNSPacket object containing the DNS response.
+
+    Returns:
+    -------
+    bytes | None: The answer section of the DNS response, or None if no answer is found.
+    """
+    for x in packet.answers:
+        if x.type_ == TYPE_A:
+            return x.data
+    return None
+
+
+def get_nameserver_ip(packet: DNSPacket) -> bytes | None:
+    """
+    Extract the IP address of the nameserver from the additional records of a DNS packet.
+
+    Args:
+    ----
+    packet (DNSPacket): The DNSPacket object containing the DNS response.
+
+    Returns:
+    -------
+    bytes | None: The IP address of the nameserver, or None if not found in the additional records.
+    """
+    for x in packet.additionals:
+        if x.type_ == TYPE_A:
+            return x.data
+    return None
+
+
+def get_nameserver(packet: DNSPacket) -> bytes | None:
+    """
+    Extract the domain name of the nameserver from the authority records of a DNS packet.
+
+    Args:
+    ----
+    packet (DNSPacket): The DNSPacket object containing the DNS response.
+
+    Returns:
+    -------
+    bytes | None: The domain name of the nameserver, or None if not found in the authority records.
+    """
+    for x in packet.authorities:
+        if x.type_ == TYPE_NS:
+            return x.data.decode("utf-8")
+    return None
+
+
+def resolve(domain_name: str, record_type: int) -> bytes:
+    """
+    Resolve a domain name by querying DNS servers, following referrals as necessary.
+
+    Args:
+    ----
+    domain_name (str): The domain name to resolve.
+    record_type (int): The type of DNS record to resolve (e.g., TYPE_A, TYPE_NS).
+
+    Returns:
+    -------
+    bytes: The resolved data for the domain name, typically an IP address.
+
+    Raises:
+    ------
+    ValueError: If the resolution process fails or cannot find the requested data.
+    """
+    # List of Root Servers
+    # https://www.iana.org/domains/root/servers
+    nameserver = "202.12.27.33"
+    while True:
+        print(f"Querying {nameserver} for {domain_name}")
+        response = send_query(nameserver, domain_name, record_type)
+        if ip := get_answer(response):
+            return ip
+        if ns_ip := get_nameserver_ip(response):
+            nameserver = ns_ip
+        elif ns_domain := get_nameserver(response):
+            nameserver = resolve(ns_domain, TYPE_A)
+        else:
+            msg = "something went wrong"
+            raise ValueError(msg)
